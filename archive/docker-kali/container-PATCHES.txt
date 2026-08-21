@@ -1,0 +1,5 @@
+LUPA argparse compatibility:
+- arquivo: lupa/osint-cnpj
+- mudança: 100% -> 100%% somente na string help do argumento --passive
+- efeito: corrige --help em Python atual; o texto exibido continua 100%
+- o arquivo original permanece intacto no container Docker kali
