@@ -15,7 +15,14 @@ __pycache__/
 *.p12
 *.log
 *.mmd
+*.zip
+*.part
 *_graph.json
+SHA256SUMS.local
 reports/
 resultados/
-
+dossie_*.json
+dossie_*_grafo.mmd
+relatorio_cpf_*.json
+relatorio_cpf_*_grafo.mmd
+.cache/

@@ -1,9 +1,0 @@
-container=kali
-container_state=running
-container_created=2026-07-17T13:03:03.239680006Z
-image=debian:bookworm
-image_id=sha256:8a8cd02c5912770b4980228a54d4aff9e4f986f1eb2525d2d371dec5232cefcc
-image_architecture=arm64
-exported_at=2026-08-21T14:11:16Z
-gladios_source=/usr/local/bin/gladios.py
-lupa_source=/usr/local/bin/osint-cnpj
