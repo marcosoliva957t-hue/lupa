@@ -204,5 +204,176 @@ class LocalIndexTests(unittest.TestCase):
             self.assertNotIn(cpf_sub, serialized)
 
 
+class LeadEnrichmentTests(unittest.TestCase):
+    def test_receitaws_is_normalized_only_for_exact_cnpj(self):
+        payload = {
+            "status": "OK",
+            "cnpj": "11.222.333/0001-81",
+            "nome": "ACME LTDA",
+            "fantasia": "ACME",
+            "capital_social": "218878.00",
+            "email": "vendas@acme.test",
+            "telefone": "(11) 3333-4444 / (11) 99999-8888",
+            "atividade_principal": [{"code": "62.01-5-01", "text": "Software"}],
+            "atividades_secundarias": [],
+            "qsa": [],
+        }
+        record = lupa.normalize_cnpj_api("ReceitaWS", payload, "11222333000181")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["capital_social"], 218878.0)
+        self.assertEqual(record["ddd_telefone_1"], "551133334444")
+        self.assertEqual(record["ddd_telefone_2"], "5511999998888")
+        self.assertEqual(record["cnae_fiscal"], "6201501")
+        self.assertIsNone(lupa.normalize_cnpj_api("ReceitaWS", payload, "11222333000180"))
+
+    def test_business_page_extracts_structured_and_explicit_contacts(self):
+        html = """
+        <html><head>
+          <script type="application/ld+json">
+          {"@type":"Organization","contactPoint":{"@type":"ContactPoint",
+           "contactType":"sales","telephone":"+55 11 3333-4444","email":"vendas@acme.test"}}
+          </script>
+        </head><body>
+          <a href="tel:+5511999998888">WhatsApp comercial</a>
+          <a href="mailto:contato@acme.test">Contato</a>
+          <a href="/fale-conosco">Fale conosco</a>
+        </body></html>
+        """
+        contacts, links, _ = lupa.extract_business_contacts_from_html(html, "https://acme.test/")
+        values = {(item["channel"], item["value"]) for item in contacts}
+        self.assertIn(("phone", "+551133334444"), values)
+        self.assertIn(("phone", "+5511999998888"), values)
+        self.assertIn(("email", "vendas@acme.test"), values)
+        self.assertIn("https://acme.test/fale-conosco", links)
+
+    def test_rdap_validates_company_but_suppresses_registry_contacts_from_sales(self):
+        payload = {
+            "ldhName": "acme.com.br",
+            "handle": "acme.com.br",
+            "entities": [{
+                "handle": "11222333000181",
+                "roles": ["registrant"],
+                "publicIds": [{"type": "cnpj", "identifier": "11.222.333/0001-81"}],
+                "vcardArray": ["vcard", [
+                    ["version", {}, "text", "4.0"],
+                    ["kind", {}, "text", "org"],
+                    ["fn", {}, "text", "ACME LTDA"],
+                    ["tel", {}, "uri", "tel:+551133334444"],
+                    ["email", {}, "text", "registro@acme.test"],
+                ]],
+            }],
+        }
+        with mock.patch.object(lupa, "http_json", return_value=(payload, None)):
+            result = lupa.query_domain_rdap("acme.com.br", "11222333000181", 1)
+        self.assertEqual(result["status"], "match")
+        record = result["records"][0]
+        self.assertTrue(record["registrant_cnpj_exact"])
+        entity = record["entities"][0]
+        self.assertEqual(entity["published_contact_fields"], ["email", "tel"])
+        self.assertFalse(entity["contact_values_exported"])
+        self.assertNotIn("registro@acme.test", json.dumps(result))
+        self.assertNotIn("+551133334444", json.dumps(result))
+        with mock.patch.object(lupa, "http_json", return_value=(payload, None)):
+            verification_result = lupa.query_domain_rdap(
+                "acme.com.br", "11222333000181", 1, include_contact_values=True
+            )
+        verification_contacts = verification_result["records"][0]["entities"][0]["verification_contacts"]
+        self.assertEqual({item["value"] for item in verification_contacts}, {
+            "registro@acme.test", "+551133334444",
+        })
+        self.assertTrue(all(not item["sales_eligible"] for item in verification_contacts))
+
+    def test_registrobr_whois_contacts_are_verification_only(self):
+        response = """
+        domain:      acme.com.br
+        owner:       ACME LTDA
+        ownerid:     11.222.333/0001-81
+        owner-c:     ACME1
+        tech-c:      TECH1
+
+        nic-hdl-br:  ACME1
+        person:      Contato ACME
+        e-mail:      registro@acme.test
+        phone:       +55 11 3333-4444
+
+        nic-hdl-br:  TECH1
+        person:      Suporte ACME
+        e-mail:      suporte@acme.test
+        """
+        parsed = lupa.parse_registrobr_whois(response, "acme.com.br", "11222333000181")
+        self.assertTrue(parsed["domain_exact"])
+        self.assertTrue(parsed["owner_cnpj_exact"])
+        self.assertEqual({item["value"] for item in parsed["verification_contacts"]}, {
+            "registro@acme.test", "+551133334444", "suporte@acme.test",
+        })
+        self.assertTrue(all(item["verification_only"] for item in parsed["verification_contacts"]))
+        self.assertTrue(all(not item["sales_eligible"] for item in parsed["verification_contacts"]))
+
+    def test_cvm_connector_keeps_company_and_responsible_phones(self):
+        header = (
+            "CNPJ_CIA;DENOM_SOCIAL;DDD_TEL;TEL;EMAIL;TP_RESP;RESP;"
+            "DDD_TEL_RESP;TEL_RESP;EMAIL_RESP\n"
+        )
+        row = (
+            "11.222.333/0001-81;ACME S.A.;11;33334444;ri@acme.test;"
+            "DIRETOR DE RI;PESSOA;11;999998888;diretoria.ri@acme.test\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cvm" / "cad_cia_aberta.csv"
+            path.parent.mkdir()
+            path.write_text(header + row, encoding="latin-1")
+            result = lupa.query_cvm_cnpj("11222333000181", Path(directory), 1, False)
+        self.assertEqual(result["status"], "match")
+        record = result["records"][0]
+        self.assertEqual(record["DDD_TEL"], "11")
+        self.assertEqual(record["TEL"], "33334444")
+        self.assertEqual(record["DDD_TEL_RESP"], "11")
+        self.assertEqual(record["TEL_RESP"], "999998888")
+
+    def test_seller_profile_excludes_personal_email_and_isolated_mobile(self):
+        data = {
+            "cnpj": "11222333000181",
+            "razao_social": "ACME LTDA",
+            "email": "pessoa@gmail.com",
+        }
+        results = [
+            lupa.result_base(
+                "cnpj_api_brasilapi", "BrasilAPI", "https://example.test", "match",
+                records=[{
+                    "email": "pessoa@gmail.com",
+                    "ddd_telefone_1": "11999998888",
+                    "ddd_telefone_2": "",
+                }],
+            ),
+            lupa.result_base(
+                "whois_registrobr_fixture", "WHOIS Registro.br", "https://registro.br/", "match",
+                records=[{"verification_contacts": [{
+                    "channel": "phone", "value": "+551132222222",
+                    "verification_only": True, "sales_eligible": False,
+                }]}],
+            ),
+        ]
+        websites = [{
+            "status": "verified",
+            "contacts": [{
+                "channel": "email",
+                "value": "vendas@acme.test",
+                "contact_role": "sales",
+                "source_id": "official_website_fixture",
+                "source_name": "Site ACME",
+                "source_url": "https://acme.test/contato",
+                "queried_at": "2026-01-01T00:00:00+00:00",
+                "match_method": "exact_cnpj_on_homepage",
+                "extraction_method": "json_ld",
+            }],
+        }]
+        profile = lupa.build_lead_profile(data, results, websites, [])
+        ready_values = {item["value"] for item in profile["seller_ready_contacts"]}
+        self.assertIn("vendas@acme.test", ready_values)
+        self.assertNotIn("pessoa@gmail.com", ready_values)
+        self.assertNotIn("+5511999998888", ready_values)
+        self.assertNotIn("+551132222222", ready_values)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LUPA v7.0 - OSINT passivo por CNPJ e CPF (Kali Edition)
+LUPA v7.1 - OSINT passivo por CNPJ e CPF (Kali Edition)
 
 Princípios do modo CPF:
 - somente fontes públicas/abertas e gratuitas;
@@ -23,12 +23,15 @@ import csv
 import datetime as dt
 import hashlib
 import hmac
+from html.parser import HTMLParser
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -37,11 +40,12 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.robotparser
 import zipfile
 
 
-VERSION = "7.0.0"
-SCHEMA_VERSION = "lupa.report.v2"
+VERSION = "7.1.0"
+SCHEMA_VERSION = "lupa.report.v3"
 USER_AGENT = f"LUPA/{VERSION} (+OSINT passivo; fontes publicas)"
 MAX_JSON_BYTES = 12 * 1024 * 1024
 MAX_DATASET_BYTES = 250 * 1024 * 1024
@@ -51,7 +55,11 @@ COMPRAS_API = "https://dadosabertos.compras.gov.br/modulo-fornecedor/1_consultar
 CVM_DATASET = "https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"
 BCB_ODATA = "https://olinda.bcb.gov.br/olinda/servico/BcBase/versao/v2/odata"
 TCU_CNPJ_API = "https://certidoes-apf.apps.tcu.gov.br/api/rest/publico/certidoes"
+RECEITAWS_API = "https://receitaws.com.br/v1/cnpj"
+IANA_RDAP_BOOTSTRAP = "https://data.iana.org/rdap/dns.json"
+REGISTROBR_POLICY_URL = "https://registro.br/politica-de-privacidade/"
 _LOCAL_SECRET_CACHE: dict[str, bytes] = {}
+_RDAP_BOOTSTRAP_CACHE: object | None = None
 
 G = "\033[92m"
 Y = "\033[93m"
@@ -124,6 +132,206 @@ def mask_cpf(cpf: str) -> str:
 def format_cnpj(cnpj: str) -> str:
     cnpj = only_digits(cnpj)
     return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+
+
+EMAIL_PATTERN = re.compile(r"(?<![\w.+-])([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,63})(?![\w.-])")
+PHONE_PATTERN = re.compile(
+    r"(?<!\d)(?:\+?55[\s.()-]*)?(?:\(?[1-9]\d\)?[\s.()-]*)"
+    r"(?:9\d{4}|[2-5]\d{3})[\s.-]*\d{4}(?!\d)"
+)
+ROLE_EMAIL_PREFIXES = {
+    "atendimento", "comercial", "compras", "contato", "faleconosco", "financeiro",
+    "info", "investidores", "juridico", "licitacao", "marketing", "ouvidoria",
+    "recepcao", "relacionamento", "ri", "sac", "sales", "suporte", "vendas",
+}
+FREE_MAIL_DOMAINS = {
+    "bol.com.br", "gmail.com", "hotmail.com", "icloud.com", "live.com",
+    "outlook.com", "proton.me", "protonmail.com", "uol.com.br", "yahoo.com",
+    "yahoo.com.br",
+}
+
+
+def normalize_email(value: object) -> str | None:
+    candidate = str(value or "").strip().lower().removeprefix("mailto:")
+    candidate = candidate.split("?", 1)[0].strip(" <>.,;:\"'")
+    if not EMAIL_PATTERN.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def extract_emails(value: object) -> list[str]:
+    found: list[str] = []
+    for match in EMAIL_PATTERN.finditer(str(value or "")):
+        email = normalize_email(match.group(1))
+        if email and email not in found:
+            found.append(email)
+    return found
+
+
+def email_is_role_based(email: str) -> bool:
+    local = email.split("@", 1)[0].lower()
+    compact = re.sub(r"[^a-z0-9]", "", normalize_text(local))
+    return compact in ROLE_EMAIL_PREFIXES or any(
+        compact.startswith(prefix) for prefix in ROLE_EMAIL_PREFIXES if len(prefix) >= 5
+    )
+
+
+def normalize_phone(value: object) -> str | None:
+    digits = only_digits(value)
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("55") and len(digits) in {12, 13}:
+        national = digits[2:]
+    elif len(digits) in {10, 11}:
+        national = digits
+        digits = "55" + digits
+    else:
+        return None
+    if len(national) not in {10, 11} or national[0] == "0" or len(set(national)) <= 2:
+        return None
+    subscriber = national[2:]
+    if len(subscriber) == 9 and not subscriber.startswith("9"):
+        return None
+    if len(subscriber) == 8 and subscriber[0] not in "2345":
+        return None
+    return "+" + digits
+
+
+def normalize_registry_phone(value: object) -> str | None:
+    raw = str(value or "").strip().lower().removeprefix("tel:")
+    digits = only_digits(raw)
+    if raw.startswith("+") and 8 <= len(digits) <= 15:
+        return "+" + digits
+    return normalize_phone(raw)
+
+
+def extract_phone_candidates(value: object) -> list[str]:
+    text = str(value or "")
+    candidates: list[str] = []
+    direct = normalize_phone(text)
+    if direct:
+        candidates.append(direct)
+    for match in PHONE_PATTERN.finditer(text):
+        phone = normalize_phone(match.group(0))
+        if phone and phone not in candidates:
+            candidates.append(phone)
+    return candidates
+
+
+def normalize_domain(value: object) -> str | None:
+    raw = str(value or "").strip().lower().rstrip(".")
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw if "://" in raw else "//" + raw)
+    if parsed.username or parsed.password:
+        return None
+    host = (parsed.hostname or "").strip().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    try:
+        host = host.encode("idna").decode("ascii")
+        ipaddress.ip_address(host)
+        return None
+    except UnicodeError:
+        return None
+    except ValueError:
+        pass
+    if len(host) > 253 or "." not in host:
+        return None
+    labels = host.split(".")
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels):
+        return None
+    return host
+
+
+def hostname_is_public(hostname: str) -> bool:
+    try:
+        addresses = {item[4][0].split("%", 1)[0] for item in socket.getaddrinfo(hostname, None)}
+    except (OSError, socket.gaierror):
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
+class BusinessContactHTMLParser(HTMLParser):
+    """Extrai apenas sinais de contato explícitos de uma página corporativa."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.href_contacts: list[tuple[str, str]] = []
+        self.links: list[tuple[str, str]] = []
+        self.meta_contacts: list[tuple[str, str]] = []
+        self.jsonld_chunks: list[str] = []
+        self.text_chunks: list[str] = []
+        self._anchor_href: str | None = None
+        self._anchor_text: list[str] = []
+        self._in_jsonld = False
+        self._jsonld_buffer: list[str] = []
+        self._suppressed_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = {str(key).lower(): str(value or "") for key, value in attrs}
+        lower_tag = tag.lower()
+        if lower_tag in {"style", "noscript"}:
+            self._suppressed_depth += 1
+        if lower_tag == "script":
+            if attributes.get("type", "").lower().split(";", 1)[0].strip() == "application/ld+json":
+                self._in_jsonld = True
+                self._jsonld_buffer = []
+            else:
+                self._suppressed_depth += 1
+        if lower_tag == "a":
+            href = attributes.get("href", "").strip()
+            self._anchor_href = href or None
+            self._anchor_text = []
+            if href.lower().startswith("mailto:"):
+                self.href_contacts.append(("email", href))
+            elif href.lower().startswith("tel:"):
+                self.href_contacts.append(("phone", href))
+        if lower_tag == "meta":
+            itemprop = attributes.get("itemprop", "").lower()
+            content = attributes.get("content", "").strip()
+            if itemprop in {"email", "telephone"} and content:
+                self.meta_contacts.append(("email" if itemprop == "email" else "phone", content))
+
+    def handle_endtag(self, tag: str) -> None:
+        lower_tag = tag.lower()
+        if lower_tag == "a" and self._anchor_href:
+            self.links.append((self._anchor_href, " ".join(self._anchor_text).strip()))
+            self._anchor_href = None
+            self._anchor_text = []
+        if lower_tag == "script":
+            if self._in_jsonld:
+                self.jsonld_chunks.append("".join(self._jsonld_buffer))
+                self._in_jsonld = False
+                self._jsonld_buffer = []
+            elif self._suppressed_depth:
+                self._suppressed_depth -= 1
+        elif lower_tag in {"style", "noscript"} and self._suppressed_depth:
+            self._suppressed_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._in_jsonld:
+            self._jsonld_buffer.append(data)
+            return
+        if self._suppressed_depth:
+            return
+        cleaned = re.sub(r"\s+", " ", data).strip()
+        if cleaned:
+            self.text_chunks.append(cleaned)
+            if self._anchor_href:
+                self._anchor_text.append(cleaned)
+
+    def visible_text(self) -> str:
+        return " ".join(self.text_chunks)
 
 
 def banner(mode: str) -> None:
@@ -211,6 +419,183 @@ def http_json(
 def make_http_request(url: str, timeout: float = 10) -> object | None:
     data, _ = http_json(url, timeout=timeout)
     return data
+
+
+class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allowed_hosts: set[str]) -> None:
+        super().__init__()
+        self.allowed_hosts = {host.lower() for host in allowed_hosts}
+
+    def redirect_request(
+        self, req: urllib.request.Request, fp: object, code: int, msg: str,
+        headers: object, newurl: str,
+    ) -> urllib.request.Request | None:
+        absolute = urllib.parse.urljoin(req.full_url, newurl)
+        parsed = urllib.parse.urlparse(absolute)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or host not in self.allowed_hosts:
+            raise urllib.error.HTTPError(absolute, 403, "redirecionamento fora do domínio", headers, fp)
+        if not hostname_is_public(host):
+            raise urllib.error.HTTPError(absolute, 403, "destino não público", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, absolute)
+
+
+def fetch_public_html(
+    url: str,
+    allowed_hosts: set[str],
+    timeout: float,
+    *,
+    max_bytes: int = 2 * 1024 * 1024,
+) -> tuple[str | None, str | None, str | None]:
+    """Busca HTML público com limite, host fixo e proteção contra redirecionamento interno."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or host not in allowed_hosts:
+        return None, None, "URL fora do domínio permitido"
+    if not hostname_is_public(host):
+        return None, None, "domínio não resolve exclusivamente para endereços públicos"
+    opener = urllib.request.build_opener(_PublicRedirectHandler(allowed_hosts))
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        },
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                return None, response.geturl(), f"conteúdo não HTML: {content_type or 'não informado'}"
+            length = response.headers.get("Content-Length")
+            if length and int(length) > max_bytes:
+                return None, response.geturl(), f"página excede {max_bytes} bytes"
+            raw = response.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                return None, response.geturl(), f"página excede {max_bytes} bytes"
+            charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                text = raw.decode(charset, errors="replace")
+            except LookupError:
+                text = raw.decode("utf-8", errors="replace")
+            return text, response.geturl(), None
+    except urllib.error.HTTPError as exc:
+        return None, None, f"HTTP {exc.code}: {exc.reason}"
+    except urllib.error.URLError as exc:
+        return None, None, f"falha de rede: {getattr(exc, 'reason', exc)}"
+    except (OSError, ValueError) as exc:
+        return None, None, f"falha de leitura: {exc}"
+
+
+def robots_allows(url: str, allowed_hosts: set[str], timeout: float) -> tuple[bool, str]:
+    parsed = urllib.parse.urlparse(url)
+    robots_url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "/robots.txt", "", "", ""))
+    robots_text, _, error = fetch_public_html(robots_url, allowed_hosts, timeout, max_bytes=256 * 1024)
+    if error and "conteúdo não HTML" in error:
+        raw, raw_error = http_bytes(
+            robots_url, timeout=timeout, accept="text/plain,*/*;q=0.1", max_bytes=256 * 1024
+        )
+        if not raw_error and raw is not None:
+            robots_text = raw.decode("utf-8", errors="replace")
+            error = None
+    if error or robots_text is None:
+        return True, "robots.txt indisponível; coleta conservadora de até poucas páginas"
+    parser = urllib.robotparser.RobotFileParser()
+    parser.set_url(robots_url)
+    parser.parse(robots_text.splitlines())
+    return parser.can_fetch(USER_AGENT, url), robots_url
+
+
+def _jsonld_contact_values(value: object, active_org: bool = False) -> list[tuple[str, str, str]]:
+    found: list[tuple[str, str, str]] = []
+    if isinstance(value, list):
+        for item in value:
+            found.extend(_jsonld_contact_values(item, active_org))
+        return found
+    if not isinstance(value, dict):
+        return found
+    raw_types = value.get("@type", [])
+    types = raw_types if isinstance(raw_types, list) else [raw_types]
+    normalized_types = {normalize_text(item).replace(" ", "") for item in types}
+    organization_types = {
+        "organization", "corporation", "localbusiness", "professionalservice", "store",
+        "financialservice", "medicalorganization", "educationalorganization", "governmentorganization",
+    }
+    is_org = active_org or bool(normalized_types & organization_types)
+    role = str(value.get("contactType") or value.get("name") or "business")
+    if is_org:
+        for raw in value.get("email", []) if isinstance(value.get("email"), list) else [value.get("email")]:
+            for email in extract_emails(raw):
+                found.append(("email", email, role))
+        phone_values = value.get("telephone", [])
+        if not isinstance(phone_values, list):
+            phone_values = [phone_values]
+        for raw in phone_values:
+            for phone in extract_phone_candidates(raw):
+                found.append(("phone", phone, role))
+    for child in value.values():
+        if isinstance(child, (dict, list)):
+            found.extend(_jsonld_contact_values(child, is_org))
+    return found
+
+
+def extract_business_contacts_from_html(html: str, source_url: str) -> tuple[list[dict], list[str], str]:
+    parser = BusinessContactHTMLParser()
+    try:
+        parser.feed(html)
+    except (ValueError, AssertionError):
+        pass
+    found: list[dict] = []
+
+    def add(channel: str, value: object, method: str, role: str = "business") -> None:
+        normalized_values = extract_emails(value) if channel == "email" else extract_phone_candidates(value)
+        for normalized in normalized_values:
+            key = (channel, normalized, method, role)
+            if any((item["channel"], item["value"], item["extraction_method"], item["contact_role"]) == key for item in found):
+                continue
+            found.append(
+                {
+                    "channel": channel,
+                    "value": normalized,
+                    "contact_role": role,
+                    "source_url": source_url,
+                    "extraction_method": method,
+                }
+            )
+
+    for channel, value in parser.href_contacts:
+        add(channel, value, "href_scheme")
+    for channel, value in parser.meta_contacts:
+        add(channel, value, "structured_meta")
+    for chunk in parser.jsonld_chunks:
+        try:
+            parsed = json.loads(chunk)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for channel, value, role in _jsonld_contact_values(parsed):
+            add(channel, value, "json_ld", role)
+
+    visible_text = parser.visible_text()
+    for email in extract_emails(visible_text):
+        add("email", email, "page_text")
+    for phone in extract_phone_candidates(visible_text):
+        add("phone", phone, "page_text")
+
+    contact_links: list[str] = []
+    markers = {"contato", "contact", "fale conosco", "fale-conosco", "atendimento", "sobre", "about"}
+    for href, anchor_text in parser.links:
+        absolute = urllib.parse.urljoin(source_url, href)
+        parsed_link = urllib.parse.urlparse(absolute)
+        haystack = normalize_text(parsed_link.path + " " + anchor_text)
+        if parsed_link.scheme not in {"http", "https"}:
+            continue
+        if any(marker.replace("-", " ") in haystack for marker in markers):
+            canonical = urllib.parse.urlunparse(
+                (parsed_link.scheme, parsed_link.netloc, parsed_link.path or "/", "", parsed_link.query, "")
+            )
+            if canonical not in contact_links:
+                contact_links.append(canonical)
+    return found, contact_links, visible_text
 
 
 def result_base(
@@ -793,7 +1178,8 @@ def query_cvm_cnpj(cnpj: str, cache_dir: Path, timeout: float, refresh: bool) ->
         "CNPJ_CIA", "DENOM_SOCIAL", "DENOM_COMERC", "DT_REG", "DT_CONST", "DT_CANCEL",
         "MOTIVO_CANCEL", "SIT", "DT_INI_SIT", "CD_CVM", "SETOR_ATIV", "TP_MERC",
         "CATEG_REG", "DT_INI_CATEG", "SIT_EMISSOR", "CONTROLE_ACIONARIO", "MUN", "UF",
-        "PAIS", "EMAIL", "TP_RESP", "RESP", "DT_INI_RESP", "CNPJ_AUDITOR", "AUDITOR",
+        "PAIS", "DDD_TEL", "TEL", "EMAIL", "TP_RESP", "RESP", "DT_INI_RESP",
+        "DDD_TEL_RESP", "TEL_RESP", "EMAIL_RESP", "CNPJ_AUDITOR", "AUDITOR",
     ]
     try:
         with path.open("r", encoding="latin-1", errors="replace", newline="") as stream:
@@ -1620,6 +2006,51 @@ def run_cpf(args: argparse.Namespace, cpf: str) -> int:
 def normalize_cnpj_api(source_name: str, raw: object, cnpj: str) -> dict | None:
     if not isinstance(raw, dict):
         return None
+    if source_name == "ReceitaWS":
+        returned = only_digits(raw.get("cnpj"))
+        if str(raw.get("status") or "").upper() != "OK" or returned != cnpj:
+            return None
+        phones = extract_phone_candidates(raw.get("telefone"))
+        main_activities = raw.get("atividade_principal") or []
+        main_activity = main_activities[0] if isinstance(main_activities, list) and main_activities else {}
+        secondary = raw.get("atividades_secundarias") or []
+        capital_raw = re.sub(r"[^0-9,.-]", "", str(raw.get("capital_social") or "0"))
+        if "," in capital_raw:
+            capital_raw = capital_raw.replace(".", "").replace(",", ".")
+        try:
+            capital = float(capital_raw or 0)
+        except ValueError:
+            capital = 0.0
+        return {
+            "cnpj": cnpj,
+            "razao_social": raw.get("nome", ""),
+            "nome_fantasia": raw.get("fantasia", ""),
+            "descricao_situacao_cadastral": raw.get("situacao", ""),
+            "data_inicio_atividade": raw.get("abertura", ""),
+            "natureza_juridica": raw.get("natureza_juridica", ""),
+            "capital_social": capital,
+            "porte": raw.get("porte", ""),
+            "email": raw.get("email", ""),
+            "ddd_telefone_1": only_digits(phones[0]) if phones else "",
+            "ddd_telefone_2": only_digits(phones[1]) if len(phones) > 1 else "",
+            "logradouro": raw.get("logradouro", ""),
+            "numero": raw.get("numero", ""),
+            "complemento": raw.get("complemento", ""),
+            "bairro": raw.get("bairro", ""),
+            "municipio": raw.get("municipio", ""),
+            "uf": raw.get("uf", ""),
+            "cep": raw.get("cep", ""),
+            "cnae_fiscal": only_digits(main_activity.get("code")) if isinstance(main_activity, dict) else "",
+            "cnae_fiscal_descricao": main_activity.get("text", "") if isinstance(main_activity, dict) else "",
+            "cnaes_secundarios": [
+                {"codigo": only_digits(item.get("code")), "descricao": item.get("text", "")}
+                for item in secondary if isinstance(item, dict)
+            ],
+            "qsa": [
+                {"nome_socio": item.get("nome"), "qualificacao_socio": item.get("qual")}
+                for item in raw.get("qsa", []) if isinstance(item, dict)
+            ],
+        }
     if source_name in {"BrasilAPI", "MinhaReceita"}:
         returned = only_digits(raw.get("cnpj"))
         if returned and returned != cnpj:
@@ -1706,7 +2137,7 @@ def _merge_list_values(records: list[tuple[str, dict]], field: str) -> list[obje
 
 def aggregate_cnpj_records(records: list[tuple[str, dict]], cnpj: str) -> dict:
     """Cria visão canônica, votos por campo e divergências sem ocultar a origem."""
-    preferred = {"BrasilAPI": 0, "MinhaReceita": 1, "CNPJ.ws": 2}
+    preferred = {"BrasilAPI": 0, "MinhaReceita": 1, "CNPJ.ws": 2, "ReceitaWS": 3}
     all_fields = sorted({key for _, record in records for key in record if not key.startswith("_")})
     canonical: dict[str, object] = {"cnpj": cnpj}
     consensus: dict[str, dict] = {}
@@ -1759,13 +2190,17 @@ def aggregate_cnpj_records(records: list[tuple[str, dict]], cnpj: str) -> dict:
     return canonical
 
 
-def consultar_cnpj_multi_api(cnpj: str, timeout: float = 12) -> tuple[dict | None, str | None]:
+def consultar_cnpj_multi_api(
+    cnpj: str, timeout: float = 12, *, include_receitaws: bool = True
+) -> tuple[dict | None, str | None]:
     print(f"{Y}[*] Coletando e comparando todas as APIs cadastrais públicas...{W}")
     sources = [
         ("BrasilAPI", f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}"),
         ("MinhaReceita", f"https://minhareceita.org/{cnpj}"),
         ("CNPJ.ws", f"https://publica.cnpj.ws/cnpj/{cnpj}"),
     ]
+    if include_receitaws:
+        sources.append(("ReceitaWS", f"{RECEITAWS_API}/{cnpj}"))
 
     def fetch(source_name: str, url: str) -> tuple[str, str, object | None, str | None, int]:
         started = time.monotonic()
@@ -1793,7 +2228,9 @@ def consultar_cnpj_multi_api(cnpj: str, timeout: float = 12) -> tuple[dict | Non
                 print(f"  {Y}[!] {source_name}: {error or 'sem resposta exata'}{W}")
     if not collected:
         return None, None
-    collected.sort(key=lambda item: {"BrasilAPI": 0, "MinhaReceita": 1, "CNPJ.ws": 2}.get(item[0], 99))
+    collected.sort(
+        key=lambda item: {"BrasilAPI": 0, "MinhaReceita": 1, "CNPJ.ws": 2, "ReceitaWS": 3}.get(item[0], 99)
+    )
     aggregate = aggregate_cnpj_records(collected, cnpj)
     aggregate["_lupa_api_health"] = statuses
     return aggregate, "consenso: " + ", ".join(source for source, _ in collected)
@@ -1865,7 +2302,293 @@ def verified_github_orgs(company_name: str, confirmed_domains: list[str], timeou
     return verified
 
 
-def consultar_entidade_rdap(cnpj: str, timeout: float = 10) -> dict | None:
+def rdap_vcard_properties(vcard: object) -> dict[str, list[object]]:
+    properties: dict[str, list[object]] = {}
+    if not isinstance(vcard, list) or len(vcard) < 2 or not isinstance(vcard[1], list):
+        return properties
+    for item in vcard[1]:
+        if not isinstance(item, list) or len(item) < 4:
+            continue
+        key = str(item[0]).lower()
+        properties.setdefault(key, []).append(item[3])
+    return properties
+
+
+def rdap_public_documents(entity: dict) -> list[dict]:
+    documents: list[dict] = []
+    for public_id in entity.get("publicIds", []) or []:
+        if not isinstance(public_id, dict):
+            continue
+        identifier = str(public_id.get("identifier") or "")
+        kind = str(public_id.get("type") or "").lower()
+        if kind in {"cnpj", "cpf"} and identifier:
+            documents.append({"type": kind, "masked": kind == "cpf", "value": only_digits(identifier) if kind == "cnpj" else None})
+    handle = str(entity.get("handle") or "")
+    if len(only_digits(handle)) == 14 and not any(item.get("type") == "cnpj" for item in documents):
+        documents.append({"type": "cnpj", "masked": False, "value": only_digits(handle)})
+    return documents
+
+
+def rdap_entity_summaries(
+    entities: object, cnpj: str, depth: int = 0, *, include_contact_values: bool = False
+) -> list[dict]:
+    if depth > 3 or not isinstance(entities, list):
+        return []
+    summaries: list[dict] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        properties = rdap_vcard_properties(entity.get("vcardArray"))
+        roles = [str(role).lower() for role in entity.get("roles", []) if role]
+        kinds = [str(value).lower() for value in properties.get("kind", [])]
+        documents = rdap_public_documents(entity)
+        contact_fields = sorted(
+            field for field in ("email", "tel", "adr") if properties.get(field)
+        )
+        verification_contacts: list[dict] = []
+        if include_contact_values:
+            for raw_email in properties.get("email", []):
+                for email in extract_emails(raw_email):
+                    verification_contacts.append(
+                        {
+                            "channel": "email",
+                            "value": email,
+                            "roles": roles,
+                            "verification_only": True,
+                            "sales_eligible": False,
+                            "allowed_use": "technical_administrative_or_legal_domain_contact_only",
+                            "do_not_redistribute": True,
+                        }
+                    )
+            for raw_phone in properties.get("tel", []):
+                phone = normalize_registry_phone(raw_phone)
+                if phone:
+                    verification_contacts.append(
+                        {
+                            "channel": "phone",
+                            "value": phone,
+                            "roles": roles,
+                            "verification_only": True,
+                            "sales_eligible": False,
+                            "allowed_use": "technical_administrative_or_legal_domain_contact_only",
+                            "do_not_redistribute": True,
+                        }
+                    )
+        organization_names = [
+            str(value) for key in ("org", "fn") for value in properties.get(key, [])
+            if value and "individual" not in kinds
+        ]
+        summaries.append(
+            {
+                "handle": entity.get("handle"),
+                "roles": roles,
+                "kind": kinds[0] if kinds else None,
+                "organization": organization_names[0] if organization_names else None,
+                "public_ids": documents,
+                "registrant_cnpj_exact": "registrant" in roles and any(
+                    item.get("type") == "cnpj" and item.get("value") == cnpj for item in documents
+                ),
+                "published_contact_fields": contact_fields,
+                "verification_contacts": verification_contacts,
+                "contact_values_exported": include_contact_values,
+                "sales_eligible": False,
+                "restriction": "Dados de diretório de registro não integram a saída comercial.",
+            }
+        )
+        summaries.extend(
+            rdap_entity_summaries(
+                entity.get("entities"), cnpj, depth + 1,
+                include_contact_values=include_contact_values,
+            )
+        )
+    return summaries
+
+
+def authoritative_rdap_url(domain: str, timeout: float) -> tuple[str | None, str | None]:
+    global _RDAP_BOOTSTRAP_CACHE
+    if domain.endswith(".br"):
+        return f"https://rdap.registro.br/domain/{urllib.parse.quote(domain, safe='.-')}", None
+    if _RDAP_BOOTSTRAP_CACHE is None:
+        _RDAP_BOOTSTRAP_CACHE, error = http_json(IANA_RDAP_BOOTSTRAP, timeout=timeout)
+        if error:
+            return None, error
+    if not isinstance(_RDAP_BOOTSTRAP_CACHE, dict):
+        return None, "bootstrap RDAP da IANA em formato inesperado"
+    tld = domain.rsplit(".", 1)[-1]
+    for service in _RDAP_BOOTSTRAP_CACHE.get("services", []) or []:
+        if not isinstance(service, list) or len(service) < 2:
+            continue
+        tlds, endpoints = service[0], service[1]
+        if tld not in [str(item).lower() for item in tlds or []] or not endpoints:
+            continue
+        base = str(endpoints[0]).rstrip("/")
+        return f"{base}/domain/{urllib.parse.quote(domain, safe='.-')}", None
+    return None, f"nenhum servidor RDAP autoritativo para .{tld}"
+
+
+def query_domain_rdap(
+    domain: str, cnpj: str, timeout: float, *, include_contact_values: bool = False
+) -> dict:
+    source_id = "rdap_domain_" + hashlib.sha256(domain.encode()).hexdigest()[:12]
+    source_name = f"RDAP autoritativo - {domain}"
+    url, resolver_error = authoritative_rdap_url(domain, timeout)
+    if resolver_error or not url:
+        return result_base(source_id, source_name, IANA_RDAP_BOOTSTRAP, "error", error=resolver_error or "sem endpoint")
+    data, error = http_json(url, timeout=timeout)
+    if error:
+        return result_base(source_id, source_name, url, "error", error=error)
+    if not isinstance(data, dict):
+        return result_base(source_id, source_name, url, "error", error="resposta RDAP inesperada")
+    returned_domain = normalize_domain(data.get("ldhName") or data.get("unicodeName"))
+    if returned_domain != domain:
+        return result_base(
+            source_id, source_name, url, "no_match",
+            details={"discarded_domain": returned_domain, "expected_domain": domain},
+        )
+    summaries = rdap_entity_summaries(
+        data.get("entities"), cnpj, include_contact_values=include_contact_values
+    )
+    registrant_exact = any(item.get("registrant_cnpj_exact") for item in summaries)
+    record = {
+        "domain": domain,
+        "handle": data.get("handle"),
+        "status": data.get("status", []),
+        "nameservers": [
+            item.get("ldhName") for item in data.get("nameservers", [])
+            if isinstance(item, dict) and item.get("ldhName")
+        ],
+        "events": data.get("events", []),
+        "entities": summaries,
+        "registrant_cnpj_exact": registrant_exact,
+        "registry_contact_values_exported_for_sales": False,
+        "registry_contact_values_available_for_verification": include_contact_values,
+    }
+    result = result_base(
+        source_id, source_name, url, "match", records=[record],
+        details={
+            "relation": "registrant_cnpj_exact" if registrant_exact else "domain_exact_only",
+            "sales_use": False,
+            "policy": REGISTROBR_POLICY_URL if domain.endswith(".br") else "registry_policy_and_applicable_data_protection_law",
+            "published_contact_fields": sorted({
+                field for item in summaries for field in item.get("published_contact_fields", [])
+            }),
+            "verification_contact_count": sum(
+                len(item.get("verification_contacts", [])) for item in summaries
+            ),
+        },
+    )
+    result["match_method"] = "domain_exact"
+    result["confidence"] = 1.0
+    return result
+
+
+def parse_registrobr_whois(text: str, domain: str, cnpj: str) -> dict:
+    fields: dict[str, list[str]] = {}
+    contact_blocks: list[dict[str, str]] = []
+    current_contact: dict[str, str] | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^([a-z][a-z0-9-]*):\s*(.*?)\s*$", line, re.IGNORECASE)
+        if not match:
+            continue
+        key, value = match.group(1).lower(), match.group(2)
+        fields.setdefault(key, []).append(value)
+        if key == "nic-hdl-br":
+            if current_contact:
+                contact_blocks.append(current_contact)
+            current_contact = {"handle": value}
+        elif current_contact is not None and key in {"person", "e-mail", "email", "phone", "telefone"}:
+            current_contact[key] = value
+    if current_contact:
+        contact_blocks.append(current_contact)
+
+    returned_domain = normalize_domain((fields.get("domain") or [""])[0])
+    exact_domain = returned_domain == domain
+    owner_document = only_digits((fields.get("ownerid") or [""])[0])
+    owner_exact = owner_document == cnpj
+    owner_handles = set(fields.get("owner-c", []))
+    tech_handles = set(fields.get("tech-c", []))
+    contacts: list[dict] = []
+    for block in contact_blocks:
+        handle = block.get("handle", "")
+        roles: list[str] = []
+        if handle in owner_handles:
+            roles.append("registrant")
+        if handle in tech_handles:
+            roles.append("technical")
+        for key in ("e-mail", "email"):
+            for email in extract_emails(block.get(key)):
+                contacts.append(
+                    {
+                        "channel": "email", "value": email, "handle": handle, "roles": roles,
+                        "verification_only": True, "sales_eligible": False,
+                        "allowed_use": "technical_administrative_or_legal_domain_contact_only",
+                        "do_not_redistribute": True,
+                    }
+                )
+        for key in ("phone", "telefone"):
+            phone = normalize_registry_phone(block.get(key))
+            if phone:
+                contacts.append(
+                    {
+                        "channel": "phone", "value": phone, "handle": handle, "roles": roles,
+                        "verification_only": True, "sales_eligible": False,
+                        "allowed_use": "technical_administrative_or_legal_domain_contact_only",
+                        "do_not_redistribute": True,
+                    }
+                )
+    unique_contacts = {
+        (item["channel"], item["value"], tuple(item["roles"])): item for item in contacts
+    }
+    return {
+        "domain": returned_domain,
+        "domain_exact": exact_domain,
+        "owner_cnpj_exact": owner_exact,
+        "owner": (fields.get("owner") or [None])[0],
+        "status": fields.get("status", []),
+        "owner_handles": sorted(owner_handles),
+        "technical_handles": sorted(tech_handles),
+        "verification_contacts": list(unique_contacts.values()),
+        "rate_limited": "rate limit" in text.lower() or "reduced information" in text.lower(),
+    }
+
+
+def query_registrobr_whois(domain: str, cnpj: str, timeout: float) -> dict:
+    source_id = "whois_registrobr_" + hashlib.sha256(domain.encode()).hexdigest()[:12]
+    source_name = f"WHOIS Registro.br - {domain}"
+    source_url = "https://registro.br/tecnologia/ferramentas/whois/"
+    if not domain.endswith(".br"):
+        return result_base(
+            source_id, source_name, source_url, "not_configured",
+            details={"reason": "fallback WHOIS implementado somente para .br"},
+        )
+    output = run_cmd(["whois", "-h", "whois.registro.br", domain], timeout=max(1, int(timeout)))
+    if not output:
+        return result_base(source_id, source_name, source_url, "error", error="cliente WHOIS ausente ou consulta sem resposta")
+    parsed = parse_registrobr_whois(output, domain, cnpj)
+    if not parsed["domain_exact"]:
+        return result_base(
+            source_id, source_name, source_url, "no_match",
+            details={"reason": "WHOIS não devolveu o domínio exato", "rate_limited": parsed["rate_limited"]},
+        )
+    result = result_base(
+        source_id, source_name, source_url, "match", records=[parsed],
+        details={
+            "verification_contact_count": len(parsed["verification_contacts"]),
+            "rate_limited": parsed["rate_limited"],
+            "sales_use": False,
+            "policy": REGISTROBR_POLICY_URL,
+            "direct_exact_query": True,
+        },
+    )
+    result["match_method"] = "domain_exact+owner_cnpj_exact" if parsed["owner_cnpj_exact"] else "domain_exact"
+    result["confidence"] = 1.0
+    return result
+
+
+def consultar_entidade_rdap(
+    cnpj: str, timeout: float = 10, *, include_contact_values: bool = False
+) -> dict | None:
     print(f"\n{C}[!] REGISTRO.BR RDAP (entidade por documento; sem inferir domínios){W}")
     url = f"https://rdap.registro.br/entity/{cnpj}"
     data = make_http_request(url, timeout=timeout)
@@ -1876,13 +2599,405 @@ def consultar_entidade_rdap(cnpj: str, timeout: float = 10) -> dict | None:
     if handle and only_digits(handle) != cnpj:
         print(f"  {Y}[!] Resposta descartada: handle não corresponde exatamente ao CNPJ.{W}")
         return None
+    summaries = rdap_entity_summaries(
+        data.get("entities"), cnpj, include_contact_values=include_contact_values
+    )
+    own_properties = rdap_vcard_properties(data.get("vcardArray"))
+    own_verification_contacts: list[dict] = []
+    if include_contact_values:
+        for raw_email in own_properties.get("email", []):
+            for published_email in extract_emails(raw_email):
+                own_verification_contacts.append(
+                    {
+                        "channel": "email", "value": published_email,
+                        "verification_only": True, "sales_eligible": False,
+                        "allowed_use": "technical_administrative_or_legal_domain_contact_only",
+                        "do_not_redistribute": True,
+                    }
+                )
+        for raw_phone in own_properties.get("tel", []):
+            published_phone = normalize_registry_phone(raw_phone)
+            if published_phone:
+                own_verification_contacts.append(
+                    {
+                        "channel": "phone", "value": published_phone,
+                        "verification_only": True, "sales_eligible": False,
+                        "allowed_use": "technical_administrative_or_legal_domain_contact_only",
+                        "do_not_redistribute": True,
+                    }
+                )
     print(f"  {G}[+] Entidade RDAP confirmada pelo CNPJ exato.{W}")
     return {
         "handle": handle,
         "status": data.get("status", []),
         "remarks": data.get("remarks", []),
+        "organization": next((str(item) for item in own_properties.get("fn", []) if item), None),
+        "entities": summaries,
+        "published_contact_fields": sorted(
+            field for field in ("email", "tel", "adr") if own_properties.get(field)
+        ),
+        "verification_contacts": own_verification_contacts,
+        "contact_values_exported_for_sales": False,
+        "contact_values_available_for_verification": include_contact_values,
         "source_url": url,
         "match_method": "document_exact",
+        "policy": REGISTROBR_POLICY_URL,
+    }
+
+
+def discover_domain_candidates(data: dict, results: list[dict], explicit_domains: list[str]) -> list[dict]:
+    candidates: dict[str, dict] = {}
+
+    def add_email(value: object, source_id: str, source_url: str, match_method: str) -> None:
+        for email in extract_emails(value):
+            domain = normalize_domain(email.rsplit("@", 1)[-1])
+            if not domain or domain in FREE_MAIL_DOMAINS:
+                continue
+            item = candidates.setdefault(domain, {"domain": domain, "evidence": []})
+            evidence = {
+                "source_id": source_id,
+                "source_url": source_url,
+                "match_method": match_method,
+                "relation": "domain_from_exact_cnpj_contact_email",
+            }
+            if evidence not in item["evidence"]:
+                item["evidence"].append(evidence)
+
+    add_email(data.get("email"), "cnpj_canonical", "", "document_exact_consensus")
+    for result in results:
+        source_id = str(result.get("source_id") or "")
+        if result.get("status") != "match":
+            continue
+        source_url = str(result.get("source_url") or "")
+        match_method = str(result.get("match_method") or "document_exact")
+        for record in result.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            if source_id.startswith("cnpj_api_"):
+                add_email(record.get("email"), source_id, source_url, match_method)
+            elif source_id == "rfb_cnpj_completo":
+                establishment = record.get("estabelecimento") or {}
+                if isinstance(establishment, dict):
+                    add_email(establishment.get("email"), source_id, source_url, match_method)
+            elif source_id == "cvm_cia_aberta":
+                add_email(record.get("EMAIL"), source_id, source_url, match_method)
+    for raw_domain in explicit_domains:
+        domain = normalize_domain(raw_domain)
+        if not domain:
+            continue
+        item = candidates.setdefault(domain, {"domain": domain, "evidence": []})
+        evidence = {
+            "source_id": "user_supplied_domain",
+            "source_url": "",
+            "match_method": "unverified_input",
+            "relation": "candidate_only_until_page_or_rdap_validation",
+        }
+        if evidence not in item["evidence"]:
+            item["evidence"].append(evidence)
+    return sorted(candidates.values(), key=lambda item: item["domain"])
+
+
+def page_contains_cnpj(html: str, cnpj: str) -> bool:
+    return cnpj in html or format_cnpj(cnpj) in html
+
+
+def query_official_website(
+    candidate: dict,
+    cnpj: str,
+    company_name: str,
+    fantasy_name: str,
+    rdap_result: dict | None,
+    timeout: float,
+    max_pages: int = 4,
+) -> dict:
+    domain = str(candidate.get("domain") or "")
+    website_source_id = "official_website_" + hashlib.sha256(domain.encode()).hexdigest()[:12]
+    allowed_hosts = {domain, "www." + domain}
+    start_urls = [f"https://{domain}/", f"https://www.{domain}/", f"http://{domain}/"]
+    homepage_html: str | None = None
+    homepage_url: str | None = None
+    errors: list[str] = []
+    robots_notes: list[str] = []
+    for start_url in start_urls:
+        allowed, robots_note = robots_allows(start_url, allowed_hosts, timeout)
+        robots_notes.append(robots_note)
+        if not allowed:
+            errors.append(f"{start_url}: bloqueado por robots.txt")
+            continue
+        html, final_url, error = fetch_public_html(start_url, allowed_hosts, timeout)
+        if html is not None and final_url:
+            homepage_html, homepage_url = html, final_url
+            break
+        errors.append(f"{start_url}: {error}")
+    if homepage_html is None or homepage_url is None:
+        return {
+            "domain": domain,
+            "status": "error",
+            "errors": errors,
+            "contacts": [],
+            "candidate_evidence": candidate.get("evidence", []),
+        }
+
+    first_contacts, contact_links, visible_text = extract_business_contacts_from_html(
+        homepage_html, homepage_url
+    )
+    normalized_page = normalize_text(visible_text)
+    normalized_names = [
+        normalize_text(value) for value in (company_name, fantasy_name)
+        if len(normalize_text(value)) >= 4
+    ]
+    verification: list[str] = []
+    if page_contains_cnpj(homepage_html, cnpj):
+        verification.append("exact_cnpj_on_homepage")
+    if any(name in normalized_page for name in normalized_names):
+        verification.append("exact_company_or_fantasy_name_on_homepage")
+    if rdap_result and rdap_result.get("status") == "match":
+        records = rdap_result.get("records", [])
+        if any(isinstance(record, dict) and record.get("registrant_cnpj_exact") for record in records):
+            verification.append("rdap_registrant_cnpj_exact")
+    if not verification:
+        return {
+            "domain": domain,
+            "status": "unverified",
+            "homepage": homepage_url,
+            "verification": [],
+            "contacts": [],
+            "discarded_contact_candidates": len(first_contacts),
+            "candidate_evidence": candidate.get("evidence", []),
+            "errors": errors,
+        }
+
+    pages = [homepage_url]
+    contacts = list(first_contacts)
+    queued: list[str] = []
+    for link in contact_links:
+        parsed = urllib.parse.urlparse(link)
+        if (parsed.hostname or "").lower() in allowed_hosts and link not in pages and link not in queued:
+            queued.append(link)
+    for page_url in queued[: max(0, max_pages - 1)]:
+        allowed, robots_note = robots_allows(page_url, allowed_hosts, timeout)
+        robots_notes.append(robots_note)
+        if not allowed:
+            errors.append(f"{page_url}: bloqueado por robots.txt")
+            continue
+        html, final_url, error = fetch_public_html(page_url, allowed_hosts, timeout)
+        if html is None or not final_url:
+            errors.append(f"{page_url}: {error}")
+            continue
+        page_contacts, _, _ = extract_business_contacts_from_html(html, final_url)
+        pages.append(final_url)
+        contacts.extend(page_contacts)
+
+    unique: dict[tuple[str, str], dict] = {}
+    method_priority = {"json_ld": 0, "structured_meta": 1, "href_scheme": 2, "page_text": 3}
+    for contact in contacts:
+        key = (str(contact.get("channel")), str(contact.get("value")))
+        existing = unique.get(key)
+        if existing and method_priority.get(str(existing.get("extraction_method")), 9) <= method_priority.get(
+            str(contact.get("extraction_method")), 9
+        ):
+            continue
+        enriched = dict(contact)
+        enriched.update(
+            {
+                "source_id": website_source_id,
+                "source_name": f"Site corporativo verificado - {domain}",
+                "domain": domain,
+                "match_method": "+".join(verification),
+                "queried_at": utc_now(),
+                "sales_eligible": enriched.get("channel") == "phone" or email_is_role_based(str(enriched.get("value"))),
+                "requires_lgpd_basis": True,
+                "requires_opt_out": True,
+            }
+        )
+        if enriched.get("channel") == "email" and not enriched["sales_eligible"]:
+            enriched["sales_review_reason"] = "endereço não parece caixa funcional da empresa"
+        unique[key] = enriched
+    return {
+        "domain": domain,
+        "status": "verified",
+        "homepage": homepage_url,
+        "verification": verification,
+        "pages_queried": pages,
+        "contacts": sorted(unique.values(), key=lambda item: (item["channel"], item["value"])),
+        "candidate_evidence": candidate.get("evidence", []),
+        "robots": sorted(set(robots_notes)),
+        "errors": errors,
+    }
+
+
+def build_lead_profile(data: dict, results: list[dict], websites: list[dict], domains: list[dict]) -> dict:
+    grouped: dict[tuple[str, str], dict] = {}
+
+    def add(
+        channel: str,
+        raw_value: object,
+        source: dict,
+        *,
+        role: str = "business",
+        extraction_method: str = "published_field",
+        source_kind: str = "cnpj_registry",
+    ) -> None:
+        values = extract_emails(raw_value) if channel == "email" else extract_phone_candidates(raw_value)
+        for value in values:
+            key = (channel, value)
+            item = grouped.setdefault(
+                key,
+                {
+                    "channel": channel,
+                    "value": value,
+                    "roles": [],
+                    "sources": [],
+                    "source_kinds": [],
+                },
+            )
+            if role not in item["roles"]:
+                item["roles"].append(role)
+            if source_kind not in item["source_kinds"]:
+                item["source_kinds"].append(source_kind)
+            raw_source_id = str(source.get("source_id") or "")
+            if raw_source_id.startswith("cnpj_api_"):
+                source_family = "rfb_derived_cnpj_apis"
+            elif raw_source_id == "rfb_cnpj_completo":
+                source_family = "rfb_open_data"
+            elif raw_source_id == "cvm_cia_aberta":
+                source_family = "cvm_open_data"
+            elif raw_source_id.startswith("official_website_"):
+                source_family = raw_source_id
+            else:
+                source_family = raw_source_id
+            provenance = {
+                "source_id": source.get("source_id"),
+                "source_family": source_family,
+                "source_name": source.get("source_name"),
+                "source_url": source.get("source_url"),
+                "queried_at": source.get("queried_at"),
+                "match_method": source.get("match_method"),
+                "extraction_method": extraction_method,
+            }
+            if provenance not in item["sources"]:
+                item["sources"].append(provenance)
+
+    for result in results:
+        if result.get("status") != "match":
+            continue
+        source_id = str(result.get("source_id") or "")
+        for record in result.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            if source_id.startswith("cnpj_api_"):
+                api_source = dict(result)
+                record_provenance = record.get("_lupa_provenance") or {}
+                if isinstance(record_provenance, dict):
+                    api_source["source_url"] = record_provenance.get("source_url") or result.get("source_url")
+                    api_source["queried_at"] = record_provenance.get("queried_at") or result.get("queried_at")
+                    api_source["match_method"] = record_provenance.get("match_method") or result.get("match_method")
+                add("email", record.get("email"), api_source)
+                add("phone", record.get("ddd_telefone_1"), api_source)
+                add("phone", record.get("ddd_telefone_2"), api_source)
+            elif source_id == "rfb_cnpj_completo":
+                establishment = record.get("estabelecimento") or {}
+                if isinstance(establishment, dict):
+                    add("email", establishment.get("email"), result, source_kind="official_open_data")
+                    add("phone", f"{establishment.get('ddd1', '')}{establishment.get('telefone1', '')}", result, source_kind="official_open_data")
+                    add("phone", f"{establishment.get('ddd2', '')}{establishment.get('telefone2', '')}", result, source_kind="official_open_data")
+            elif source_id == "cvm_cia_aberta":
+                add("email", record.get("EMAIL"), result, role="company", source_kind="official_open_data")
+                add("phone", f"{record.get('DDD_TEL', '')}{record.get('TEL', '')}", result, role="company", source_kind="official_open_data")
+                add("email", record.get("EMAIL_RESP"), result, role=str(record.get("TP_RESP") or "responsible"), source_kind="official_open_data")
+                add("phone", f"{record.get('DDD_TEL_RESP', '')}{record.get('TEL_RESP', '')}", result, role=str(record.get("TP_RESP") or "responsible"), source_kind="official_open_data")
+    for website in websites:
+        if website.get("status") != "verified":
+            continue
+        for contact in website.get("contacts", []):
+            if not isinstance(contact, dict):
+                continue
+            source = {
+                "source_id": contact.get("source_id"),
+                "source_name": contact.get("source_name"),
+                "source_url": contact.get("source_url"),
+                "queried_at": contact.get("queried_at"),
+                "match_method": contact.get("match_method"),
+            }
+            add(
+                str(contact.get("channel")), contact.get("value"), source,
+                role=str(contact.get("contact_role") or "business"),
+                extraction_method=str(contact.get("extraction_method") or "website"),
+                source_kind="verified_official_website",
+            )
+
+    contacts: list[dict] = []
+    for item in grouped.values():
+        independent_sources = len({source.get("source_family") for source in item["sources"]})
+        channel = item["channel"]
+        value = item["value"]
+        verified_site = "verified_official_website" in item["source_kinds"]
+        official_open = "official_open_data" in item["source_kinds"]
+        if channel == "email":
+            domain = value.rsplit("@", 1)[-1]
+            sales_eligible = email_is_role_based(value) and domain not in FREE_MAIL_DOMAINS
+            reason = None if sales_eligible else "e-mail pessoal, gratuito ou não funcional exige revisão e base legal"
+            phone_kind = None
+        else:
+            national = only_digits(value)[2:] if only_digits(value).startswith("55") else only_digits(value)
+            phone_kind = "mobile_or_whatsapp_possible" if len(national) == 11 else "landline_or_switchboard"
+            sales_eligible = verified_site or (official_open and phone_kind == "landline_or_switchboard") or independent_sources >= 2
+            reason = None if sales_eligible else "celular cadastral isolado pode pertencer a pessoa física; revisão necessária"
+        contact = dict(item)
+        contact.update(
+            {
+                "independent_source_count": independent_sources,
+                "confidence": 1.0 if independent_sources >= 2 else 0.95 if verified_site or official_open else 0.85,
+                "phone_kind": phone_kind,
+                "sales_eligible": sales_eligible,
+                "sales_review_reason": reason,
+                "requires_lgpd_basis": True,
+                "requires_opt_out": True,
+                "registry_directory_contact": False,
+            }
+        )
+        contacts.append(contact)
+    contacts.sort(key=lambda item: (not item["sales_eligible"], item["channel"], item["value"]))
+    seller_ready = [item for item in contacts if item["sales_eligible"]]
+    matched_ids = {str(item.get("source_id")) for item in results if item.get("status") == "match"}
+    return {
+        "company": {
+            "cnpj": data.get("cnpj"),
+            "razao_social": data.get("razao_social"),
+            "nome_fantasia": data.get("nome_fantasia"),
+            "situacao": data.get("descricao_situacao_cadastral"),
+            "porte": data.get("porte"),
+            "capital_social": data.get("capital_social"),
+            "cnae_principal": data.get("cnae_fiscal"),
+            "cnae_descricao": data.get("cnae_fiscal_descricao"),
+            "municipio": data.get("municipio"),
+            "uf": data.get("uf"),
+        },
+        "qualification_signals": {
+            "cvm_public_company": "cvm_cia_aberta" in matched_ids,
+            "government_supplier": "compras_fornecedor" in matched_ids,
+            "government_contracts_in_local_index": "pncp_contratos" in matched_ids,
+            "bcb_supervised_entity": "bcb_entidades" in matched_ids,
+        },
+        "domain_candidates": domains,
+        "verified_websites": [
+            {key: site.get(key) for key in ("domain", "homepage", "verification", "pages_queried")}
+            for site in websites if site.get("status") == "verified"
+        ],
+        "contacts": contacts,
+        "seller_ready_contacts": seller_ready,
+        "compliance": {
+            "registry_directory_contacts_excluded": True,
+            "registro_br_policy": REGISTROBR_POLICY_URL,
+            "personal_looking_emails_excluded_from_seller_ready": True,
+            "isolated_mobile_numbers_require_review": True,
+            "required_controls": [
+                "documentar base legal e teste de balanceamento quando aplicável",
+                "informar origem e finalidade no primeiro contato",
+                "manter lista de oposição/descadastramento e não contatar",
+                "não usar contatos para assédio, disparo massivo ou finalidade incompatível",
+            ],
+        },
     }
 
 
@@ -2054,8 +3169,12 @@ def cnpj_api_results(data: dict | None) -> list[dict]:
         "BrasilAPI": "https://brasilapi.com.br/docs#tag/CNPJ",
         "MinhaReceita": "https://minhareceita.org/",
         "CNPJ.ws": "https://publica.cnpj.ws/",
+        "ReceitaWS": "https://receitaws.com.br/api",
     }
-    for source in ("BrasilAPI", "MinhaReceita", "CNPJ.ws"):
+    ordered_sources = ["BrasilAPI", "MinhaReceita", "CNPJ.ws"]
+    if "ReceitaWS" in raw_records or "ReceitaWS" in health:
+        ordered_sources.append("ReceitaWS")
+    for source in ordered_sources:
         item = health.get(source, {})
         if source in raw_records:
             results.append(
@@ -2085,7 +3204,9 @@ def run_cnpj(args: argparse.Namespace, cnpj: str) -> int:
     source: str | None = None
     results: list[dict] = []
     if not args.no_network:
-        data, source = consultar_cnpj_multi_api(cnpj, timeout=args.timeout)
+        data, source = consultar_cnpj_multi_api(
+            cnpj, timeout=args.timeout, include_receitaws=not args.skip_receitaws
+        )
         results.extend(cnpj_api_results(data))
 
     jobs: list[tuple[str, object]] = []
@@ -2179,25 +3300,119 @@ def run_cnpj(args: argparse.Namespace, cnpj: str) -> int:
     print(f"  {Y}[i] Associação reversa por nome foi removida: homônimos não são vínculo confiável.{W}")
 
     geoint = analyze_geoint(data)
-    rdap = consultar_entidade_rdap(cnpj, timeout=args.timeout)
+    rdap = None if args.no_network else consultar_entidade_rdap(
+        cnpj,
+        timeout=args.timeout,
+        include_contact_values=args.include_registry_contacts,
+    )
+    domain_candidates = discover_domain_candidates(data, results, args.domain or [])
+    domain_rdap: dict[str, dict] = {}
+    domain_whois: dict[str, dict] = {}
+    websites: list[dict] = []
+    if not args.no_network:
+        for candidate in domain_candidates[:3]:
+            domain = str(candidate["domain"])
+            domain_result: dict | None = None
+            if not args.skip_rdap_domain:
+                print(f"\n{C}[!] RDAP DO DOMÍNIO: {domain}{W}")
+                domain_result = query_domain_rdap(
+                    domain,
+                    cnpj,
+                    args.timeout,
+                    include_contact_values=args.include_registry_contacts,
+                )
+                domain_rdap[domain] = domain_result
+                results.append(domain_result)
+                if domain_result.get("status") == "match":
+                    relation = (domain_result.get("details") or {}).get("relation")
+                    print(f"  {G}[+] Domínio exato consultado ({relation}). Contatos do registro não entram no lead comercial.{W}")
+                    if args.include_registry_contacts:
+                        verification_count = (domain_result.get("details") or {}).get("verification_contact_count", 0)
+                        print(f"  {Y}[i] {verification_count} contato(s) de registro incluído(s) somente no dossiê de verificação.{W}")
+                else:
+                    print(f"  {Y}[i] {domain_result.get('error') or 'domínio não confirmado no RDAP'}{W}")
+            if args.include_registry_contacts and domain.endswith(".br"):
+                print(f"\n{C}[!] WHOIS REGISTRO.BR (verificação, consulta direta): {domain}{W}")
+                whois_result = query_registrobr_whois(domain, cnpj, args.timeout)
+                domain_whois[domain] = whois_result
+                results.append(whois_result)
+                if whois_result.get("status") == "match":
+                    whois_count = (whois_result.get("details") or {}).get("verification_contact_count", 0)
+                    limited = "; resposta limitada" if (whois_result.get("details") or {}).get("rate_limited") else ""
+                    print(f"  {G}[+] {whois_count} contato(s) disponível(is) apenas para verificação{limited}.{W}")
+                else:
+                    print(f"  {Y}[i] {whois_result.get('error') or 'WHOIS não retornou vínculo exato'}{W}")
+            if not args.skip_website:
+                print(f"\n{C}[!] SITE CORPORATIVO E CONTATOS PÚBLICOS: {domain}{W}")
+                website = query_official_website(
+                    candidate,
+                    cnpj,
+                    str(data.get("razao_social") or ""),
+                    str(data.get("nome_fantasia") or ""),
+                    domain_result,
+                    args.timeout,
+                    args.max_site_pages,
+                )
+                websites.append(website)
+                website_source_id = "official_website_" + hashlib.sha256(domain.encode()).hexdigest()[:12]
+                website_status = website.get("status")
+                if website_status == "verified":
+                    contacts_found = len(website.get("contacts", []))
+                    print(f"  {G}[+] Site vinculado por evidência forte; {contacts_found} contato(s) público(s).{W}")
+                    website_source = result_base(
+                        website_source_id,
+                        f"Site corporativo verificado - {domain}",
+                        str(website.get("homepage") or ""),
+                        "match",
+                        records=[item for item in website.get("contacts", []) if isinstance(item, dict)],
+                        details={
+                            "verification": website.get("verification", []),
+                            "pages_queried": website.get("pages_queried", []),
+                            "robots": website.get("robots", []),
+                        },
+                    )
+                    website_source["match_method"] = "+".join(website.get("verification", []))
+                    website_source["confidence"] = 1.0
+                    results.append(website_source)
+                elif website_status == "unverified":
+                    print(f"  {Y}[i] Site não vinculado por CNPJ, nome exato ou titular RDAP; contatos descartados.{W}")
+                    results.append(
+                        result_base(
+                            website_source_id, f"Site candidato - {domain}",
+                            str(website.get("homepage") or ""), "no_match",
+                            details={"reason": "website_relation_unverified"},
+                        )
+                    )
+                else:
+                    print(f"  {Y}[i] Site indisponível ou não consultável.{W}")
+
     confirmed_domains: list[str] = []
-    if "@" in email:
-        domain = email.rsplit("@", 1)[1].lower().strip()
-        free_mail = {
-            "gmail.com", "hotmail.com", "outlook.com", "yahoo.com", "uol.com.br", "bol.com.br",
-        }
-        if domain and domain not in free_mail:
+    for candidate in domain_candidates:
+        domain = str(candidate["domain"])
+        from_exact_email = any(
+            evidence_item.get("relation") == "domain_from_exact_cnpj_contact_email"
+            for evidence_item in candidate.get("evidence", [])
+        )
+        website_verified = any(
+            site.get("domain") == domain and site.get("status") == "verified" for site in websites
+        )
+        rdap_exact = any(
+            isinstance(record, dict) and record.get("registrant_cnpj_exact")
+            for record in domain_rdap.get(domain, {}).get("records", [])
+        )
+        if from_exact_email or website_verified or rdap_exact:
             confirmed_domains.append(domain)
 
     dns: dict[str, dict] = {}
     certificates: dict[str, list[str]] = {}
     wayback: dict[str, list[dict]] = {}
-    for domain in confirmed_domains[:3]:
-        dns[domain] = analyze_dns(domain)
-        certificates[domain] = certificate_names(domain, timeout=args.timeout)
-        wayback[domain] = buscar_historico_wayback(domain, timeout=args.timeout)
+    if not args.no_network:
+        for domain in confirmed_domains[:3]:
+            dns[domain] = analyze_dns(domain)
+            certificates[domain] = certificate_names(domain, timeout=args.timeout)
+            wayback[domain] = buscar_historico_wayback(domain, timeout=args.timeout)
 
-    github_orgs = verified_github_orgs(
+    github_orgs = [] if args.no_network else verified_github_orgs(
         str(data.get("razao_social") or ""), confirmed_domains, timeout=args.timeout
     )
     metadata = document_metadata_module(str(data.get("razao_social") or ""), cnpj)
@@ -2207,11 +3422,15 @@ def run_cnpj(args: argparse.Namespace, cnpj: str) -> int:
         confirmed_domains[0] if confirmed_domains else None,
     )
 
+    lead_profile = build_lead_profile(data, results, websites, domain_candidates)
     evidence = {
         "matching_policy": "document_exact_or_confirmed_cadastral_field",
         "rejected_relations": ["partner_name_only", "github_first_name", "rdap_handle_as_domain"],
-        "confirmed_domains_from_cadastral_email": confirmed_domains,
+        "confirmed_domains": confirmed_domains,
         "rdap_entity": rdap,
+        "rdap_domains": domain_rdap,
+        "whois_domains": domain_whois,
+        "official_websites": websites,
         "dns": dns,
         "certificate_transparency": certificates,
         "wayback": wayback,
@@ -2219,10 +3438,11 @@ def run_cnpj(args: argparse.Namespace, cnpj: str) -> int:
         "geoint": geoint,
         "document_metadata": metadata,
         "search_queries": dorks,
+        "registry_contacts_sales_eligible": False,
     }
 
     data["_lupa_evidence"] = evidence
-    # Os registros brutos das três APIs já aparecem em `sources`; evita duplicação no canônico.
+    # Os registros brutos das APIs cadastrais já aparecem em `sources`; evita duplicação no canônico.
     data.pop("_lupa_source_records", None)
     results = deduplicate_records(results)
     report = {
@@ -2232,7 +3452,11 @@ def run_cnpj(args: argparse.Namespace, cnpj: str) -> int:
         "generated_at": utc_now(),
         "target": {"type": "CNPJ", "document": format_cnpj(cnpj), "checksum_valid": True},
         "matching_policy": {
-            "accepted": ["document_exact", "official_exact_document_filter", "cnpj_root_exact", "confirmed_cadastral_field"],
+            "accepted": [
+                "document_exact", "official_exact_document_filter", "cnpj_root_exact",
+                "confirmed_cadastral_field", "domain_exact", "rdap_registrant_cnpj_exact",
+                "exact_cnpj_or_company_name_on_official_website",
+            ],
             "rejected": ["name_only", "fuzzy_name", "first_name", "unverified_search_result", "masked_document_partial"],
         },
         "summary": {
@@ -2245,14 +3469,31 @@ def run_cnpj(args: argparse.Namespace, cnpj: str) -> int:
         "canonical": data,
         "sources": sorted(results, key=lambda item: str(item.get("source_id"))),
         "evidence_cascade": evidence,
+        "lead_profile": lead_profile,
     }
     save_history(report, cnpj, args.cache_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     json_path = args.output_dir / f"dossie_{cnpj}.json"
     graph_path = args.output_dir / f"dossie_{cnpj}_grafo.mmd"
+    leads_path = args.output_dir / f"leads_{cnpj}.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    seller_export = {
+        "schema_version": "lupa.seller-lead.v1",
+        "tool": {"name": "LUPA", "version": VERSION},
+        "generated_at": report["generated_at"],
+        "company": lead_profile["company"],
+        "qualification_signals": lead_profile["qualification_signals"],
+        "verified_websites": lead_profile["verified_websites"],
+        "contacts": lead_profile["seller_ready_contacts"],
+        "suppressed_contact_count": len(lead_profile["contacts"]) - len(lead_profile["seller_ready_contacts"]),
+        "compliance": lead_profile["compliance"],
+    }
+    leads_path.write_text(json.dumps(seller_export, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     build_company_graph(data, confirmed_domains, github_orgs, graph_path)
     print(f"\n{G}[+] Dossiê JSON: {json_path.resolve()}{W}")
+    print(f"{G}[+] Lead comercial com proveniência: {leads_path.resolve()}{W}")
+    print(f"  Contatos aptos após filtros: {len(lead_profile['seller_ready_contacts'])}")
+    print(f"  Contatos retidos para revisão: {seller_export['suppressed_contact_count']}")
     print(f"{G}[+] Grafo Mermaid: {graph_path.resolve()}{W}")
     print(f"{G}[✓] LUPA CNPJ concluída com política anti-falso positivo.{W}\n")
     return 0
@@ -2276,15 +3517,17 @@ def source_catalog() -> None:
     print("Fonte manual:")
     print("  receita_cpf: Receita Federal (data de nascimento e validação humana)")
     print("\nFontes automáticas do modo CNPJ:")
-    print("  BrasilAPI + MinhaReceita + CNPJ.ws: coleta simultânea, consenso e divergências")
+    print("  BrasilAPI + MinhaReceita + CNPJ.ws + ReceitaWS: coleta simultânea, consenso e divergências")
     print("  rfb_cnpj_completo: índice local dos dados abertos completos da Receita Federal")
     print("  tcu_certidoes_cnpj: TCU/APF (consulta consolidada exata)")
     print("  compras_fornecedor: Compras.gov.br (fornecedor exato)")
     print("  cgu_ceis + cgu_cnep + cgu_cepim: sanções/impedimentos por CNPJ exato")
-    print("  cvm_cia_aberta: cadastro diário de companhias abertas")
+    print("  cvm_cia_aberta: cadastro diário de companhias abertas, incluindo contatos da companhia/RI")
     print("  bcb_entidades: entidades supervisionadas por raiz CNPJ explicitamente rotulada")
     print("  pncp_contratos: índice incremental local de contratos e subcontratos")
-    print("  Registro.br RDAP, DNS, Certificate Transparency, Wayback e GitHub verificado")
+    print("  RDAP autoritativo: valida vínculo do domínio; contatos do diretório são excluídos de leads comerciais")
+    print("  site oficial verificado: tel:, mailto:, JSON-LD, metadados e página de contato, respeitando robots.txt")
+    print("  DNS, Certificate Transparency, Wayback e GitHub verificado")
     print("\nNenhuma fonte de vazamentos, broker de dados ou API paga é usada.")
 
 
@@ -2293,12 +3536,14 @@ def health_check(args: argparse.Namespace) -> int:
         ("BrasilAPI", "https://brasilapi.com.br/api/cnpj/v1/00000000000191", "application/json"),
         ("MinhaReceita", "https://minhareceita.org/00000000000191", "application/json"),
         ("CNPJ.ws", "https://publica.cnpj.ws/cnpj/00000000000191", "application/json"),
+        ("ReceitaWS", f"{RECEITAWS_API}/00000000000191", "application/json"),
         ("TCU/APF", f"{TCU_CNPJ_API}/00000000000191?seEmitirPDF=false", "application/json"),
         ("Compras.gov.br", f"{COMPRAS_API}?pagina=1&tamanhoPagina=10&cnpj=00000000000191&ativo=true", "application/json"),
         ("CVM", CVM_DATASET, "*/*"),
         ("Banco Central", f"{BCB_ODATA}/", "application/json"),
         ("PNCP", "https://pncp.gov.br/api/consulta/v3/api-docs", "application/json"),
         ("CGU", "https://portaldatransparencia.gov.br/download-de-dados/ceis", "text/html"),
+        ("IANA/RDAP", IANA_RDAP_BOOTSTRAP, "application/json"),
     ]
     failures = 0
     output: list[dict] = []
@@ -2334,9 +3579,16 @@ def parse_tse_years(raw: str | None) -> list[int]:
     return years
 
 
+def parse_domain_arg(raw: str) -> str:
+    domain = normalize_domain(raw)
+    if not domain:
+        raise argparse.ArgumentTypeError(f"domínio inválido: {raw}")
+    return domain
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="LUPA v7.0 - OSINT passivo, verificável e multibase por CNPJ ou CPF",
+        description="LUPA v7.1 - OSINT passivo, verificável e multibase por CNPJ ou CPF",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("documento", nargs="?", help="CPF (11 dígitos) ou CNPJ (14 dígitos)")
@@ -2352,6 +3604,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-rfb", action="store_true", help="Não consulta o índice completo local da Receita Federal")
     parser.add_argument("--skip-cvm", action="store_true", help="Não consulta o cadastro da CVM")
     parser.add_argument("--skip-bcb", action="store_true", help="Não consulta entidades supervisionadas do Banco Central")
+    parser.add_argument("--skip-receitaws", action="store_true", help="Não consulta a API pública da ReceitaWS (3 consultas/minuto)")
+    parser.add_argument("--skip-rdap-domain", action="store_true", help="Não valida os domínios candidatos via RDAP autoritativo")
+    parser.add_argument("--skip-website", action="store_true", help="Não busca contatos no site corporativo verificado")
+    parser.add_argument(
+        "--include-registry-contacts",
+        action="store_true",
+        help="Inclui contatos RDAP no dossiê somente para verificação técnica/administrativa/legal; nunca no lead comercial",
+    )
+    parser.add_argument(
+        "--domain", action="append", type=parse_domain_arg, metavar="DOMINIO",
+        help="Domínio candidato adicional para CNPJ; repetível e só aceito após validação forte",
+    )
+    parser.add_argument(
+        "--max-site-pages", type=int, default=4, metavar="N",
+        help="Máximo de páginas do site oficial por domínio (1 a 6)",
+    )
     parser.add_argument("--tse-years", metavar="ANOS", help="Anos do TSE separados por vírgula, ex.: 2024,2022")
     parser.add_argument("--refresh-cache", action="store_true", help="Baixa novamente os datasets oficiais")
     parser.add_argument(
@@ -2396,12 +3664,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     if args.timeout <= 0 or args.timeout > 120:
         parser.error("--timeout deve estar entre 0 e 120 segundos")
+    if args.max_site_pages < 1 or args.max_site_pages > 6:
+        parser.error("--max-site-pages deve estar entre 1 e 6")
 
     document = only_digits(args.documento)
     document_type = args.tipo
     if document_type == "auto":
         document_type = "cpf" if len(document) == 11 else "cnpj" if len(document) == 14 else "unknown"
     if document_type == "cpf":
+        if args.domain:
+            parser.error("--domain está disponível somente no modo CNPJ")
         return run_cpf(args, document)
     if document_type == "cnpj":
         return run_cnpj(args, document)

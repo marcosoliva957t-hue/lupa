@@ -1,14 +1,34 @@
-# LUPA v7
+# LUPA v7.1
 
 OSINT passivo, multibase e verificável por CNPJ e CPF.
 
-A versão 7 preserva os módulos CNPJ da LUPA e o modo CPF real da versão 6,
+A versão 7.1 preserva os módulos CNPJ da LUPA e o modo CPF real da versão 6,
 ampliando a cobertura apenas com fontes públicas, oficiais ou abertas e
 gratuitas. Um achado automático nunca é aceito somente por nome.
 
-## Novidades da versão 7
+## Novidades da versão 7.1
 
-- As três fontes cadastrais CNPJ (BrasilAPI, MinhaReceita e CNPJ.ws) são
+- ReceitaWS voltou como quarta fonte cadastral gratuita. O CNPJ retornado é
+  validado exatamente e o limite público de três consultas por minuto é
+  respeitado; use `--skip-receitaws` para desativá-la.
+- Os campos de telefone da companhia e do responsável de RI, já presentes no
+  CSV diário da CVM, agora são preservados.
+- Cada domínio candidato é consultado no RDAP autoritativo. Para domínios que
+  não terminam em `.br`, o servidor correto é descoberto pelo bootstrap da IANA.
+- A LUPA coleta `tel:`, `mailto:`, JSON-LD, metadados e até três páginas de
+  contato do site corporativo, somente depois de confirmar o vínculo por CNPJ,
+  nome empresarial/fantasia ou titular RDAP.
+- Um arquivo separado `leads_<CNPJ>.json` leva aos vendedores apenas canais
+  corporativos filtrados, com origem, data, método de vínculo, consenso e
+  controles de oposição. Contatos pessoais aparentes e celulares isolados
+  ficam retidos para revisão.
+- Contatos de RDAP/WHOIS podem ser incluídos no dossiê com
+  `--include-registry-contacts`, apenas para verificação técnica,
+  administrativa ou legal. Eles nunca aparecem no arquivo comercial.
+
+Também permanecem as melhorias da versão 7.0:
+
+- As fontes cadastrais CNPJ são
   consultadas em paralelo. O relatório mantém cada resposta, cria consenso por
   campo e explicita divergências; não existe mais fallback que pare na primeira.
 - TCU/APF por CNPJ exato, fornecedor do Compras.gov.br por CPF ou CNPJ exato,
@@ -40,11 +60,13 @@ CPF automático:
 
 CNPJ automático:
 
-- BrasilAPI, MinhaReceita e CNPJ.ws;
+- BrasilAPI, MinhaReceita, CNPJ.ws e ReceitaWS;
 - dados abertos completos da Receita Federal, quando o índice local existe;
-- TCU/APF, Compras.gov.br, CGU (CEIS, CNEP e CEPIM), CVM e Banco Central;
+- TCU/APF, Compras.gov.br, CGU (CEIS, CNEP e CEPIM), CVM — incluindo
+  telefones publicados — e Banco Central;
 - PNCP previamente sincronizado;
-- Registro.br RDAP, DNS, Certificate Transparency, Wayback e GitHub verificado.
+- RDAP autoritativo, site corporativo verificado, Registro.br/WHOIS opt-in,
+  DNS, Certificate Transparency, Wayback e GitHub verificado.
 
 A situação cadastral do CPF na Receita Federal continua manual, pois a página
 oficial exige data de nascimento e validação humana. Nenhum CAPTCHA, login,
@@ -84,8 +106,16 @@ lupa --version
 lupa --list-sources
 lupa --health-check
 lupa <CNPJ>
+lupa <CNPJ> --domain empresa.com.br
+lupa <CNPJ> --domain empresa.com.br --include-registry-contacts
 lupa <CPF>
 ```
+
+`--domain` é repetível. Um domínio informado pelo operador não é aceito como
+verdade: a página precisa publicar o CNPJ/nome exato ou o RDAP precisa devolver
+o CNPJ exato do titular. A coleta do site respeita `robots.txt`, fica no mesmo
+domínio, não envia formulários, não passa por login e consulta no máximo quatro
+páginas por padrão (`--max-site-pages`).
 
 No modo CPF interativo, confirme a finalidade legítima. Em automação já
 autorizada, use `--ack-lawful-use`.
@@ -133,6 +163,44 @@ Transparência.
 O padrão é `~/.cache/lupa`. Use `--cache-dir` para mudar. Cada relatório contém
 proveniência, política de vínculo, registros por fonte, consenso, divergências,
 latências e alterações desde o snapshot anterior.
+
+No modo CNPJ são produzidas três visões:
+
+- `dossie_<CNPJ>.json`: relatório técnico completo;
+- `leads_<CNPJ>.json`: saída reduzida para vendedores, sem QSA e sem contatos
+  de diretório de registro;
+- `dossie_<CNPJ>_grafo.mmd`: relações confirmadas em Mermaid.
+
+O arquivo comercial prefere caixas funcionais (`vendas@`, `comercial@`,
+`contato@` etc.), telefones publicados no site oficial ou em base oficial e
+contatos confirmados por mais de uma família de fonte. Isso reduz falsos
+positivos, mas não substitui avaliação de base legal nem autoriza disparos em
+massa.
+
+## Contatos de registro e uso comercial
+
+A política do Registro.br permite consultas individuais para finalidades de
+contato técnico, administrativo ou legal e proíbe publicidade, reprodução e
+obtenção em massa. Por isso, `--include-registry-contacts` guarda os campos
+públicos de RDAP/WHOIS apenas dentro do dossiê, com papel e restrição explícitos.
+O exportador de leads ignora essa fonte por construção.
+
+Para prospecção, a LUPA usa os telefones/e-mails cadastrais da empresa, a CVM e
+o próprio site corporativo verificado. E-mails gratuitos ou de aparência
+pessoal e celulares cadastrais encontrados isoladamente não são entregues como
+`seller_ready`.
+
+Referências que orientam esta implementação:
+
+- [layout oficial dos dados abertos do CNPJ](https://www.gov.br/receitafederal/dados/cnpj-metadados.pdf/@@download/file);
+- [cadastro diário de companhias abertas da CVM](https://dados.cvm.gov.br/dataset/cia_aberta-cad);
+- [documentação da API pública ReceitaWS](https://receitaws.com.br/api);
+- [RDAP do Registro.br](https://registro.br/rdap/) e
+  [bootstrap RDAP da IANA](https://data.iana.org/rdap/dns.json);
+- [Organization](https://schema.org/Organization) e
+  [ContactPoint](https://schema.org/ContactPoint) do Schema.org;
+- [política de privacidade do Registro.br](https://registro.br/politica-de-privacidade/);
+- [guia da ANPD sobre legítimo interesse](https://www.gov.br/anpd/pt-br/centrais-de-conteudo/materiais-educativos-e-publicacoes/guia_orientativo_hipoteses_legais_tratamento_de_dados_pessoais_legitimo_interesse).
 
 ## Verificação e desenvolvimento
 

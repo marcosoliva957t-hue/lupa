@@ -32,7 +32,7 @@ if [[ -f "${SCRIPT_DIR}/SHA256SUMS" ]] && command -v shasum >/dev/null 2>&1; the
   (cd "${SCRIPT_DIR}" && shasum -a 256 -c SHA256SUMS)
 fi
 PYTHONPYCACHEPREFIX="${PY_CACHE}" python3 -m py_compile "${SOURCE}"
-python3 "${SOURCE}" --version | grep -Fq 'LUPA 7.0.0' || die "Versão inesperada."
+python3 "${SOURCE}" --version | grep -Fq 'LUPA 7.1.0' || die "Versão inesperada."
 python3 "${SOURCE}" --list-sources >/dev/null
 
 mkdir -p "${LUPA_DIR}" "${BIN_DIR}" "${APP_DIR}" "${DESKTOP_DIR}" "${BACKUP_DIR}"
@@ -100,7 +100,7 @@ fi
 printf 'Executando smoke tests sem rede...\n'
 FIXTURE_CPF="529982247""25"
 FIXTURE_CPF_FORMATTED="529.982.247""-25"
-"${BIN_DIR}/lupa" --version | grep -Fq 'LUPA 7.0.0'
+"${BIN_DIR}/lupa" --version | grep -Fq 'LUPA 7.1.0'
 "${BIN_DIR}/lupa" --list-sources | grep -Fq 'tcu_contas_irregulares'
 "${BIN_DIR}/lupa" --list-sources | grep -Fq 'rfb_cnpj_completo'
 "${BIN_DIR}/lupa" "${FIXTURE_CPF}" --no-network --no-color --output-dir "${VERIFY_DIR}" >/dev/null

@@ -26,3 +26,5 @@ dossie_*_grafo.mmd
 relatorio_cpf_*.json
 relatorio_cpf_*_grafo.mmd
 .cache/
+.firecrawl/
+leads_*.json
